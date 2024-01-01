@@ -1,0 +1,286 @@
+---
+title: "Final Project"
+author: 
+- Katie Webb  \newline
+- GEOG215, Introduction to Spatial Data Science
+date: '`r format(Sys.Date(), "%B %d, %Y")`'
+output:
+  html_document:
+    theme: paper
+    toc: yes
+    toc_float: yes
+    code_folding: show
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## Limited Healthy Food Access in North Carolina
+
+### Introduction
+This project examines the percentage of people across North Carolina who have limited access to sourcing healthy food. As described on the CHR website, this metric focuses on those who do not live close to a grocery store and are unable to access/buy fresh or local food (https://www.countyhealthrankings.org/explore-health-rankings/county-health-rankings-model/health-factors/health-behaviors/diet-and-exercise/limited-access-to-healthy-foods?year=2023). With the growing issue of food insecurity within North Carolina, this project will aim to visualize which counties experience this problem, and may indicate more about the general health of each county's population. Having access to fresh food is a critical factor in promoting personal health and well-being. Those who do not have access to sourcing healthy food may be challenged with nutritional deficiencies and may not be informed about living a healthy lifestyle. This information is crucial to understanding which counties deserve priority for public-health resources and initiatives (i.e.: building more grocery stores for affected communities). 
+
+### Data Preparation
+
+```{r libraries, message = FALSE, warning = FALSE}
+
+# Load libraries
+library(tidyverse) 
+library(sf)
+library(tmap)
+library(spdep)
+library(knitr)
+library(kableExtra)
+```
+
+```{r data_prep, message = FALSE, warning = FALSE}
+
+# Read original data layer
+CHR <- read_csv("../raw_data/analytic_data2023_0.csv", skip = 1)
+
+# Read in spatial layer
+cnty_cb_sf <- read_sf("../raw_data/State_Owned_Lands_NC_Latest.gpkg")
+
+# Select only the columns relating to the analysis of limited access to healthy foods
+CHR <- CHR |>
+    select("countycode", 
+            "state",
+            "county",
+            "v083_rawvalue")
+
+# Rename columns
+CHR <- CHR |>
+ rename(COUNTYFP = `countycode`,
+       STATE_ABV = `state`,
+       COUNTY_NAME = county,
+       LIMITED_HF_RAW = `v083_rawvalue`)
+
+# Filter to only data in North Carolina
+CHR <- CHR |>
+  filter(STATE_ABV == "NC")
+
+# Remove the first column of NC data 
+CHR <- CHR |>
+        slice(-1)
+
+# Filter spatial layer for only FIPS column
+cnty_cb_sf <- cnty_cb_sf |>
+  select("COUNTYFP")
+
+# Table join
+CHR_joined <- left_join(cnty_cb_sf,
+                             CHR,
+                             by = c("COUNTYFP"))
+
+# Calculate percentage of limited access to healthy foods using the raw value
+CHR_joined <- CHR_joined |>
+  mutate(LIMITED_HF_RAW = as.numeric(LIMITED_HF_RAW),
+         LIMITED_HF_PCT = LIMITED_HF_RAW * 100)
+
+```
+
+The data I am using is from the County Health Rankings Report. I combined this with a spatial layer containing cartographic boundaries for all North Carolina counties. The CHR is an extensive and national report, which I prepared for analysis by only keeping identifying variables (i.e.: state, county name, and county FIPS code), and my variable of interest -- the limited access to healthy food raw value. I renamed each variable to an appropriate title to simplify my analysis, and only selected the data that was recorded for North Carolina counties. For my spatial layer, the only column I needed to keep for analysis was each county's FIPS code. I used this variable to perform a table join with the CHR and spatial data. To convert my raw-value into a percentage unit for analytical evaluation, I multiplied each value by 100. 
+
+******
+
+### Exploratory Spatial Data Analysis
+
+#### Data Description and Summary
+```{r data_summary, message = FALSE, warning = FALSE}
+
+# Get counts for number of observations
+num_observations <- length(CHR_joined$LIMITED_HF_PCT)
+
+# Get counts for number of NA values
+num_na <- sum(is.na(CHR_joined$LIMITED_HF_PCT))
+              
+# Get measures of central tendencies
+mean <- mean(CHR_joined$LIMITED_HF_PCT, na.rm = TRUE)
+maximum <- max(CHR_joined$LIMITED_HF_PCT, na.rm = TRUE)
+minimum <- min(CHR_joined$LIMITED_HF_PCT, na.rm = TRUE)
+
+# Format measures of central tendencies as percentages
+mean <- sprintf("%.2f%%", mean)
+maximum <- sprintf("%.2f%%", maximum)
+minimum <- sprintf("%.2f%%", minimum)
+
+# Get measure for variation
+variation <- sd(CHR_joined$LIMITED_HF_PCT, na.rm = TRUE)
+
+## Create a percentage distribution histogram of LIMITED_HF_PERCENTAGE for NC
+ggplot(CHR_joined, aes(x = LIMITED_HF_PCT)) +
+  geom_histogram(binwidth = 1.2, fill = "lightblue", color = "darkblue") +
+  labs(
+    title = "Percentage Distribution of Limited Access to Healthy Foods in North Carolina",
+    x = "Percentage",
+    y = "Frequency"
+  ) +
+  theme_minimal()
+
+# Create a kable table
+stats_table <- data.frame(
+  "Metric" = c("Number of Observations", "Number of NA Values", "Mean", "Minimum", "Maximum", "Standard Deviation"),
+  "Value" = c(num_observations, num_na, mean, minimum, maximum, variation)
+)
+
+# Print the table with styling and scrolling options
+kable(stats_table, caption = "Descriptive Statistics", format = "html") %>% 
+  kable_styling(bootstrap_options = c("striped", "hover", "condensed", "responsive"), full_width = T) %>% 
+  scroll_box(width = "60%", height = "200px", fixed_thead = TRUE)
+
+ 
+```
+
+My variable of interest is the percentage of people who have limited access to healthy food in North Carolina. The average percentage of people in NC who have limited access to healthy food is `r mean`, with a maximum value of `r maximum` and a minimum value of `r minimum`. The data is variable, with a standard-deviation of `r variation`. There are `r num_observations` observations, and `r num_na` NA values. The histogram has a right-skewed distribution -- most values fall near the lower percentages, with less values near the higher percentages. 
+
+******
+
+#### Geographic Distribution and Clustering
+```{r map, message = FALSE, warning = FALSE}
+
+# Put map in view mode
+tmap_mode("view")
+
+## Subset data to only observations with values
+CHR_joined <- CHR_joined |>
+  filter(!is.na(LIMITED_HF_PCT))
+
+## Create Queen case neighbors
+CHR_joined_queen <- poly2nb(CHR_joined, 
+                       queen = TRUE)
+
+## Convert neighbor object to weight matrix
+CHR_joined_wm <-  nb2listw(CHR_joined_queen,
+                         style = "B",         # B is binary (1,0)
+                         zero.policy = TRUE)  # Allow obs with 0 neighbors
+
+#
+# Moran's I
+#
+CHR_joined_moran <- moran.test(CHR_joined$LIMITED_HF_PCT,     # Variable we're analyzing
+                           listw = CHR_joined_wm,       # Sp weights matrix
+                           alternative = "two.sided",  # Clustering or Dispersion
+                           randomisation = TRUE,       # Compare to randomized values
+                           zero.policy = TRUE)         # Allow obs with 0 neighbors
+
+#### MORAN'S I VALUE ####
+moran_i_value <- CHR_joined_moran$estimate[1]
+
+#### P-Value for MORAN'S I ####
+moran_p_value <- CHR_joined_moran$p.value
+
+# Print summary
+CHR_joined_moran
+
+#
+# LISA -- Local Moran's I
+#
+CHR_joined_lisa <- localmoran(CHR_joined$LIMITED_HF_PCT,    # Variable we're analyzing
+                          listw = CHR_joined_wm,      # Weights object
+                          alternative = "two.sided", # Clustering or Dispersion
+                          zero.policy = TRUE) %>%    # Best to keep TRUE for LISA
+  as_tibble() |>                                     # Better object type
+  mutate(across(everything(), as.vector))            # Remove junk from localmoran output
+  
+
+# Add values required for LISA category
+CHR_joined_lisa <- CHR_joined_lisa |>
+  mutate(SCVAR =  scale(CHR_joined$LIMITED_HF_PCT) |> as.vector(),            # Original data column
+         LAGVAR = lag.listw(CHR_joined_wm, scale(CHR_joined$LIMITED_HF_PCT)),  # Lag of original data column
+         LISACAT = case_when(SCVAR >= 0 & LAGVAR >= 0 & `Pr(z != E(Ii))` <= 0.05 ~ 1,
+                             SCVAR <= 0 & LAGVAR <= 0 & `Pr(z != E(Ii))` <= 0.05 ~ 2,
+                             SCVAR >= 0 & LAGVAR <= 0 & `Pr(z != E(Ii))` <= 0.05 ~ 3,
+                             SCVAR <= 0 & LAGVAR >= 0 & `Pr(z != E(Ii))` <= 0.05 ~ 4,
+                             `Pr(z != E(Ii))` > 0.05 ~ 5))
+
+# Add label based on the LISACAT values
+CHR_joined_lisa <- CHR_joined_lisa |>
+  mutate(CATNAME = case_when(LISACAT == 1 ~ "HH",
+                             LISACAT == 2 ~ "LL",
+                             LISACAT == 3 ~ "HL",
+                             LISACAT == 4 ~ "LH",
+                             LISACAT == 5 ~ "Not Significant"))
+
+
+## Add LISA category column to the spatial data
+CHR_joined <- CHR_joined |>
+  mutate(LISACAT = CHR_joined_lisa$LISACAT,
+         CATNAME = CHR_joined_lisa$CATNAME)
+
+# Print summary
+CHR_joined_moran
+
+# Link to basemap background
+bg_basemap <- "https://{s}.basemaps.cartocdn.com/rastertiles/voyager/{z}/{x}/{y}{r}.png"
+
+# Create customized choropleth map
+CHR_joined_choropleth <- 
+tm_shape(CHR_joined) +                      ## The R object
+  tm_basemap(bg_basemap) +                  ## The basemap layer
+  tm_polygons("LIMITED_HF_PCT",                       ## Column with the data
+              title = "Limited Access to Healthy Foods (%)",   ## Legend title 
+              style = "jenks",               ## IMPORTANT: Classification Scheme!!
+              palette = "Reds",              ## Color ramp for the polygon fills
+              alpha = 0.9,                   ## Transparency for the polygon fills
+              border.col = "black",          ## Color for the polygon lines
+              border.alpha = 0.3,            ## Transparency for the polygon lines
+              id = "COUNTY_NAME",                   ## Column used for the hover text
+              popup.vars = c("LIMITED_HF_PCT")) +    ## Columns for click/popup text
+  tm_layout(title = "North Carolina",
+              legend.outside = TRUE,
+              frame = FALSE)
+            
+# Create LISA map
+CHR_joined_lisa_tmap <- tm_shape(CHR_joined,
+                      projection = "ESRI:102003") + 
+  tm_polygons("LISACAT", 
+              title = "LISA Category",
+              breaks = c(1, 2, 3, 4, 5, 6),
+              palette =  c("red", 
+                           "blue", 
+                           "lightpink", 
+                           "skyblue", 
+                           "grey90"),
+              colorNA = "white",
+              labels = c("High-High", 
+                         "Low-Low",
+                         "High-Low",
+                         "Low-High", 
+                         "Not significant"),
+              id = "COUNTY_NAME",  
+              border.col = "black", 
+              border.alpha = 0.25) +
+  tm_layout(title = "North Carolina",
+            frame = FALSE,
+            legend.outside = TRUE)
+
+# Map choropleth and LISA together
+tmap_arrange(CHR_joined_choropleth, 
+             CHR_joined_lisa_tmap,
+             ncol = 1,
+             nrow = 2,
+             sync = TRUE)
+
+```
+
+The Choropleth Map demonstrates that most of the high percentages are found in Eastern North Carolina, with lower percentages in Western North Carolina. Central North Carolina has a more varied distribution, with some higher and moderate percentages, in addition to a few lower percentages. The Moran's Test on this data provided a non-significant result with a p-value of `r CHR_joined_moran$p.value`, which suggests that we cannot reject the null hypothesis of spatial randomness. Moran's Test Statistic of `r CHR_joined_moran$estimate[1]` indicates a small negative spatial correlation, but the non-significant p-value implies that this correlation is not statistically meaningful. For the LISA Test, there are 2 High-High clusters, 2 Low-High clusters, 2 Low-Low clusters, and 94 Not-Significant clusters. The High-High and Low-High clusters are both found in Eastern North Carolina, and the Low-Low clusters are seen in Western North Carolina. This emphasizes what was found in the Choropleth Map -- higher percentages are found in Eastern NC, and lower percentages are seen in Western NC. 
+
+******
+
+### Conclusions
+
+This project demonstrates that although food insecurity is a prevalent issue within North Carolina, it is not spatially correlated with specific areas or counties given Moran's Test. However, this could be the silver-lining within an otherwise disparaging topic, and may indicate that the issue is not strongly related to the land and natural resources themselves. While the concentration of High-High clusters in Eastern North Carolina is concerning, the lack of significant clusters in Central NC may suggest that there is more work and analysis to be done. I would be interested in seeing how the percentage of limited access to healthy food correlates with farmland availability. This could allow us to better understand the impact that natural resources and geographical features can have on accessing healthy food. 
+
+******
+
+### Document Statistics
+```{r word count, echo = FALSE, message = FALSE}
+# create word count table
+wordcountaddin:::text_stats() %>%
+  kable_styling(bootstrap_options = c("striped",
+                                      "hover",
+                                      "condensed",
+                                      "responsive"),
+                full_width = F)
+```
